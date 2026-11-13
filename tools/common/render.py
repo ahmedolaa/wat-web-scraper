@@ -44,7 +44,13 @@ class BrowserFetcher:
         f._wait(urlsplit(url).netloc, f.effective_delay(url))
         pg = self._ctx.new_page()
         try:
-            resp = pg.goto(url, wait_until="networkidle", timeout=45_000)
+            # Some sites (e.g. Konga) never go network-idle because of analytics beacons.
+            # Wait for "load", then give client-side data fetches up to 15 s to settle.
+            resp = pg.goto(url, wait_until="load", timeout=45_000)
+            try:
+                pg.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pg.wait_for_timeout(5_000)
             html = pg.content()
             status = resp.status if resp else 0
             final = pg.url

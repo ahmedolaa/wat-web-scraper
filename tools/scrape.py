@@ -16,8 +16,13 @@ Fetch order: plain request -> headless browser (Playwright) -> Firecrawl.
 Firecrawl is never used without --approve-firecrawl; without it the tool prints a
 credit estimate and exits with code 3 so the agent can ask the user.
 
+Preview gate: `run` refuses to start (exit 7) unless `preview` was done for the same
+URL with the same filters and columns, AND `--preview-approved` is passed. The agent
+adds that flag only after the user has said OK to the preview.
+
 Exit codes: 0 ok | 2 robots.txt disallows | 3 Firecrawl approval needed |
-            4 login required (v2) | 5 blocked / fetch failed | 6 nothing extracted
+            4 login required (v2) | 5 blocked / fetch failed | 6 nothing extracted |
+            7 preview approval needed
 """
 
 import argparse
@@ -54,6 +59,64 @@ class FirecrawlNeeded(ScrapeStop):
 
 class NothingExtracted(ScrapeStop):
     exit_code = 6
+
+
+class PreviewApprovalNeeded(ScrapeStop):
+    exit_code = 7
+
+
+PREVIEW_LOG = TMP / "previews.json"   # normalized URL -> what was previewed
+
+
+def _norm_url(url):
+    p = urlsplit(url.strip())
+    host = p.netloc.lower().removeprefix("www.")
+    path = p.path.rstrip("/") or "/"
+    return f"{host}{path}" + (f"?{p.query}" if p.query else "")
+
+
+def _preview_signature(args, mod, spec):
+    return {
+        "extractor": mod.__name__.split(".")[-1],
+        "filters": json.dumps(spec, sort_keys=True, ensure_ascii=False),
+        "columns": ",".join(c.strip() for c in args.columns.split(",") if c.strip()),
+    }
+
+
+def _read_preview_log():
+    try:
+        return json.loads(PREVIEW_LOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def record_preview(args, mod, spec):
+    log_ = _read_preview_log()
+    log_[_norm_url(args.url)] = {**_preview_signature(args, mod, spec), "url": args.url,
+                                 "at": datetime.now().isoformat(timespec="seconds")}
+    PREVIEW_LOG.parent.mkdir(parents=True, exist_ok=True)
+    PREVIEW_LOG.write_text(json.dumps(log_, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def check_preview_gate(args, mod, spec):
+    """Refuse a run unless a matching preview exists and the user approved it."""
+    problems = []
+    rec = _read_preview_log().get(_norm_url(args.url))
+    if rec is None:
+        problems.append(f"no preview has been done for {args.url}")
+    else:
+        want = _preview_signature(args, mod, spec)
+        for k in ("extractor", "filters", "columns"):
+            if rec.get(k) != want[k]:
+                problems.append(f"{k} differ from the preview of {rec.get('at')} "
+                                f"(preview: {rec.get(k) or 'none'!s} | run: {want[k] or 'none'})")
+    if not args.preview_approved:
+        problems.append("--preview-approved was not given")
+    if problems:
+        raise PreviewApprovalNeeded(
+            "Run refused:\n  - " + "\n  - ".join(problems) +
+            "\nDo this: run `preview` with the same --url/--filters/--columns, show the items to the "
+            "user, and re-run with --preview-approved ONLY after the user says OK.")
 
 
 def log(msg=""):
@@ -305,6 +368,8 @@ def cmd_inspect(args, mod):
 
 def cmd_collect(args, mod, preview):
     spec = filters.load_spec(args.filters)
+    if not preview:
+        check_preview_gate(args, mod, spec)    # before any network request
     max_items = args.preview_count if preview else args.max_items
     args.max_items = max_items                 # so the Firecrawl estimate matches what we'd fetch
     fetch = Fetch(args, mod)
@@ -328,7 +393,9 @@ def cmd_collect(args, mod, preview):
             log(f"Filtered out so far: {res['removed_by_filter']}")
         out = TMP / "preview.json"
         dataset.write(out, meta, columns, res["items"])
+        record_preview(args, mod, spec)
         log(f"\nSaved preview to {out}. Show this to the user and wait for OK before `run`.")
+        log("`run` will refuse to start without --preview-approved. Add it ONLY after the user says OK.")
         return
 
     host = urlsplit(args.url).netloc.replace("www.", "").split(".")[0]
@@ -377,6 +444,8 @@ def main():
         if name == "preview":
             s.add_argument("--preview-count", type=int, default=5)
         if name == "run":
+            s.add_argument("--preview-approved", action="store_true",
+                           help="ONLY after the user said OK to the preview of this URL/filters/columns")
             s.add_argument("--out", default="", help="output file name (no extension) in .tmp/")
             s.add_argument("--no-export", action="store_true")
             s.add_argument("--no-open", action="store_true", help="don't open the report in the browser")
@@ -390,7 +459,8 @@ def main():
             cmd_collect(args, mod, preview=(args.cmd == "preview"))
     except ScrapeStop as e:
         label = {RobotsBlocked: "BLOCKED BY ROBOTS.TXT", LoginRequired: "LOGIN REQUIRED",
-                 FirecrawlNeeded: "FIRECRAWL APPROVAL NEEDED"}.get(type(e), "STOPPED")
+                 FirecrawlNeeded: "FIRECRAWL APPROVAL NEEDED",
+                 PreviewApprovalNeeded: "PREVIEW APPROVAL NEEDED"}.get(type(e), "STOPPED")
         log(f"\n{label}: {e}")
         sys.exit(e.exit_code)
 

@@ -14,7 +14,7 @@ To support a new site: copy one of the site files, change the selectors, add it 
 import importlib
 from urllib.parse import urlsplit
 
-SITE_MODULES = ["books_toscrape", "quotes_toscrape", "jumia_ng"]
+SITE_MODULES = ["books_toscrape", "quotes_toscrape", "jumia_ng", "konga"]
 
 
 def _host(url):
