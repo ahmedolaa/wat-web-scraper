@@ -97,8 +97,10 @@ def detect_block(page: Page) -> bool:
 
 
 class PoliteFetcher:
-    def __init__(self, delay: float = DEFAULT_DELAY, use_cache: bool = True, log=print):
+    def __init__(self, delay: float = DEFAULT_DELAY, use_cache: bool = True, log=print,
+                 cache_dir=None):
         self.delay = delay
+        self.cache_dir = Path(cache_dir) if cache_dir else CACHE_DIR
         self.use_cache = use_cache
         self.log = log
         self.session = requests.Session()
@@ -158,7 +160,7 @@ class PoliteFetcher:
 
     def _cache_path(self, url: str, method: str) -> Path:
         h = hashlib.sha1(f"{method}|{url}".encode()).hexdigest()[:20]
-        return CACHE_DIR / f"{urlsplit(url).netloc}_{h}.html"
+        return self.cache_dir / f"{urlsplit(url).netloc}_{h}.html"
 
     def _from_cache(self, url: str, method: str):
         if not self.use_cache:
@@ -170,10 +172,11 @@ class PoliteFetcher:
         return None
 
     def _to_cache(self, page: Page):
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._cache_path(page.url, page.method).write_text(page.html, encoding="utf-8")
 
-    def get(self, url: str, retries: int = 3) -> Page:
+    def get(self, url: str, retries: int = 3, headers=None) -> Page:
+        """headers: optional extra request headers (e.g. Accept: application/json)."""
         self.check_robots(url)
         cached = self._from_cache(url, "requests")
         if cached:
@@ -184,7 +187,7 @@ class PoliteFetcher:
         for attempt in range(retries + 1):
             self._wait(host, delay)
             try:
-                r = self.session.get(url, timeout=30, allow_redirects=True)
+                r = self.session.get(url, timeout=30, allow_redirects=True, headers=headers)
                 self.requests_made += 1
             except requests.RequestException as e:
                 last_err = f"{e.__class__.__name__}: {e}"
