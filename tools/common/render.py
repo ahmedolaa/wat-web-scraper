@@ -10,8 +10,16 @@ from .http import FetchFailed, Page, PoliteFetcher, user_agent
 
 
 class BrowserFetcher:
-    def __init__(self, fetcher: PoliteFetcher):
+    def __init__(self, fetcher: PoliteFetcher, permissions=None, block=None, profile_dir=None):
+        """permissions: optional browser permissions, e.g. ["clipboard-read", "clipboard-write"].
+        block: optional URL substrings the browser should not load (e.g. ad/analytics hosts whose
+        overlays cover buttons). Only affects third-party extras, never the site's own pages."""
         self.fetcher = fetcher
+        self.permissions = permissions
+        self.block = [b.lower() for b in (block or [])]
+        # profile_dir: keep a browser profile (incl. HTTP cache) on disk between runs, so large
+        # immutable site assets (e.g. a slow-served JS bundle) are downloaded once, not every run.
+        self.profile_dir = str(profile_dir) if profile_dir else None
         self._pw = self._browser = self._ctx = None
 
     def _start(self):
@@ -24,8 +32,17 @@ class BrowserFetcher:
                               "python -m playwright install chromium") from e
         try:
             self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(headless=True)
-            self._ctx = self._browser.new_context(user_agent=user_agent())
+            if self.profile_dir:
+                self._ctx = self._pw.chromium.launch_persistent_context(
+                    self.profile_dir, headless=True, user_agent=user_agent(),
+                    permissions=self.permissions or [])
+                self._browser = self._ctx          # .close() closes the persistent context
+            else:
+                self._browser = self._pw.chromium.launch(headless=True)
+                self._ctx = self._browser.new_context(user_agent=user_agent(),
+                                                      permissions=self.permissions or [])
+            if self.block:
+                self._ctx.route("**/*", self._route)
         except Exception as e:  # e.g. browser not downloaded yet
             if self._pw:
                 self._pw.stop()
@@ -63,6 +80,46 @@ class BrowserFetcher:
         f.raise_for_problems(page)
         f.store(page)
         return page
+
+    # ---------- interactive pages (search boxes, "Next" buttons, ...) ----------
+    def open(self, url: str, wait_for: str | None = None, wait_until: str = "domcontentloaded",
+             timeout: int = 90_000):
+        """Open a live Playwright page for sites that need typing/clicking.
+
+        Same robots.txt check and per-host delay as get(). Not cached. The caller
+        drives the page, calls pause(url) before each action that loads data,
+        and must close the page. wait_for: optional CSS selector to wait for.
+        """
+        f = self.fetcher
+        f.check_robots(url)
+        self._start()
+        self.pause(url)
+        pg = self._ctx.new_page()
+        try:
+            resp = pg.goto(url, wait_until=wait_until, timeout=timeout)
+            if wait_for:
+                pg.wait_for_selector(wait_for, timeout=timeout)
+        except Exception as e:
+            pg.close()
+            raise FetchFailed(f"Headless browser could not load {url}: {e}") from e
+        f.requests_made += 1
+        status = resp.status if resp else 0
+        if status >= 400:
+            pg.close()
+            raise FetchFailed(f"{url} returned HTTP {status}")
+        return pg
+
+    def _route(self, route):
+        u = route.request.url.lower()
+        if any(b in u for b in self.block):
+            route.abort()
+        else:
+            route.continue_()
+
+    def pause(self, url: str):
+        """Polite per-host delay before an action that makes the page load data."""
+        f = self.fetcher
+        f._wait(urlsplit(url).netloc, f.effective_delay(url))
 
     def close(self):
         if self._browser:
